@@ -1,0 +1,1266 @@
+Servo buzzer;
+#define LED_BUILTIN 2
+
+Preferences preferences;
+uint8_t chipId[6];
+uint8_t encryptionKey[16];
+
+const char* ssid = "B612";
+const char* password = "SheReallyIs1";
+const char* serverUrl = "http://192.168.100.15:3100";
+const char* deviceId = "34004eea-5b86-498f-919b-b9fe4fadb598";
+const char* apiKey = "d24798e338b09e07915697d64451a95";
+const char* websocketServer = "192.168.100.15";
+const int websocket_port = 3200;
+const char* websocket_url = "/api/webhook";
+
+const byte ROWS = 3;
+const byte COLS = 3;
+char keys[ROWS][COLS] = {
+  {'1', '2', '3'},
+  {'4', '5', '6'},
+  {'7', '8', '9'}
+};
+byte rowPins[ROWS] = {21, 27, 26};
+byte colPins[COLS] = {33, 32, 25}; 
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+String enteredAmount = "";
+
+unsigned long buzzerStartTime = 0;
+const unsigned long buzzerDuration = 100; // Duration to play the tone in milliseconds
+bool buzzerActive = false;
+int beepCount = 0;
+const int BEEP_DURATION = 500; // Duration of each beep in milliseconds
+const int BEEP_PAUSE = 200;
+unsigned long lastBeepTime = 0; // Time of the last beep
+bool beepingInProgress = false;
+
+const char* HomeMenu[] = {
+  "History",
+  "Refunds",
+  "Cash Out",
+  "Settings",
+};
+
+const char* SubItems[][4] = {
+  {"1", "Success", "Declined", "Pending"},
+  {"2", "Success", "Declined", "Pending"},
+};
+
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+MFRC522::MIFARE_Key key;
+WebSocketsClient webSocket;
+String accessToken;
+String refreshToken;
+unsigned long lastTokenRefresh = 0;
+const unsigned long tokenRefreshInterval = 50 * 60 * 1000;
+TFT_eSPI tft = TFT_eSPI();
+
+#define DEVICE_STATE_IDLE 0
+#define DEVICE_STATE_READING_CARD 1
+#define DEVICE_STATE_SENDING_DATA 2
+#define DEVICE_STATE_WAITING_RESPONSE 3
+#define DEVICE_STATE_MENU_NAVIGATION 4
+#define DEVICE_STATE_READY_TO_READ 5
+#define DEVICE_STATE_ENTERING_AMOUNT 6
+#define DEVICE_STATE_NEW_TRANSACTION 7
+#define DEVICE_STATE_NEW_QRTRANSACTION 8
+#define DEVICE_STATE_ENTERING_QR_AMOUNT 9
+#define DEVICE_STATE_DISPLAYING_QR 10
+#define DEVICE_STATE_ERROR 11
+
+enum MenuState {
+  MAIN_MENU,
+  SUB_MENU,
+  MENU_ACTION
+};
+
+int currentState = DEVICE_STATE_IDLE;
+MenuState menuState = MAIN_MENU;
+unsigned long lastReconnectAttempt = 0;
+const unsigned long reconnectInterval = 5000;
+unsigned long errorStartTime = 0;
+bool errorDisplayActive = false;
+
+int MainMenu = 0;
+int SubMenu = 0;
+int SubMenuItem = 0;
+
+const int TotalHomeItems = sizeof(HomeMenu) / sizeof(HomeMenu[0]);
+const int MaxSubMenuItems = 4;
+
+int SubMenuCount = 0;
+
+String globalCardData;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  tft.init();
+  tft.setRotation(1);  // Rotate display to landscape mode
+  tft.fillScreen(TFT_BLACK);  // Clear screen
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);  // Set text color to white with black background
+  tft.setTextSize(1);  // Set default text size
+  
+  tft.drawString("Initializing...", 10, 10);
+  delay(1000);
+  printMenuState();
+  showMenu();
+  Serial.println("Setup complete");
+  generateEncryptionKey();
+
+  preferences.begin("secureStorage", false);
+  bool isPlainText = preferences.getBool("isPlainText", true);  // Default to true for safety
+  String storedDeviceId = preferences.getString("deviceId", "");
+  String storedApiKey = preferences.getString("apiKey", "");
+
+  Serial.println("Raw stored values:");
+  Serial.println("Device ID: " + storedDeviceId);
+  Serial.println("API Key: " + storedApiKey);
+  Serial.println("Is Plain Text: " + String(isPlainText));
+
+  if (storedDeviceId.length() == 0 || storedApiKey.length() == 0) {
+    Serial.println("Device not configured. Please flash configuration first.");
+    while(1) { delay(1000); }  }
+
+  if (isPlainText) {
+    Serial.println("Encrypting plain text values...");
+    String encryptedDeviceId, encryptedApiKey;
+    encrypt(storedDeviceId, encryptedDeviceId);
+    encrypt(storedApiKey, encryptedApiKey);
+    
+    preferences.putString("deviceId", encryptedDeviceId);
+    preferences.putString("apiKey", encryptedApiKey);
+    preferences.putBool("isPlainText", false);  // Reset the flag
+    
+    Serial.println("Encrypted values:");
+    Serial.println("Device ID: " + encryptedDeviceId);
+    Serial.println("API Key: " + encryptedApiKey);
+  } else {
+    Serial.println("Decrypting stored values...");
+    String decryptedDeviceId, decryptedApiKey;
+    bool decryptSuccessDeviceId = decrypt(storedDeviceId, decryptedDeviceId);
+    bool decryptSuccessApiKey = decrypt(storedApiKey, decryptedApiKey);
+    
+    if (decryptSuccessDeviceId && decryptSuccessApiKey) {
+      storedDeviceId = decryptedDeviceId;
+      storedApiKey = decryptedApiKey;
+      Serial.println("Decryption successful");
+    } else {
+      Serial.println("Decryption failed. Using encrypted values as-is.");
+    }
+  }
+
+  preferences.end();
+
+  Serial.println("Final configuration:");
+  Serial.println("Device ID: " + storedDeviceId);
+  Serial.println("API Key: " + storedApiKey);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+    tft.fillScreen(TFT_BLACK);
+    tft.drawString("Connecting to WiFi...", 10, 10);
+    tft.drawString(ssid, 10, 30);
+    yield(); // Add this to prevent watchdog resets
+  }
+  Serial.println("Connected to WiFi");
+
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+  while (time(nullptr) < 1000000000) {
+    delay(100);
+    Serial.println("Waiting for time sync...");
+  }
+  printStoredValues();
+  authenticateDevice();
+  pinMode(2, INPUT_PULLUP);
+  buzzer.attach(BUZZER_PIN);
+  for (byte i = 0; i < MFRC522::MF_KEY_SIZE; i++) {
+    key.keyByte[i] = 0xFF;  // Default key
+  }
+
+  SPI.begin();
+  mfrc522.PCD_Init();
+  showMenu();
+
+  Serial.println("Setup complete");
+}
+
+void loop() {
+  webSocket.loop();
+  unsigned long now = millis();
+  static unsigned long lastStatusCheck = 0;
+  static unsigned long lastAuthCheck = 0;
+
+
+  if (now - lastAuthCheck > 60000) {     lastAuthCheck = now;
+    if (accessToken.length() == 0) {
+      Serial.println("Access token is empty. Re-authenticating...");
+      authenticateDevice();
+    }
+  }
+
+  webSocket.loop();
+  handleBeepSequence();
+
+  if (now - lastStatusCheck > 125000) {
+    lastStatusCheck = now;
+    if (webSocket.isConnected()) {
+      Serial.println("WebSocket is connected");
+    } else {
+      Serial.println("WebSocket is disconnected");
+    }
+  }
+
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastTokenRefresh >= tokenRefreshInterval) {
+    if (refreshAccessToken()) {
+      webSocket.disconnect();
+      setupWebSocket();
+    }
+    lastTokenRefresh = currentMillis;
+  }
+
+  if (errorDisplayActive) {
+    if (now - errorStartTime >= 2000) { // 2000 milliseconds = 2 seconds
+      errorDisplayActive = false;
+      currentState = DEVICE_STATE_MENU_NAVIGATION;
+      menuState = MAIN_MENU;
+      showMenu();
+    }
+    return;
+  }
+
+  if (now - lastReconnectAttempt > reconnectInterval) {
+  lastReconnectAttempt = now;
+  if (!webSocket.isConnected()) {
+    Serial.println("Attempting to reconnect WebSocket...");
+    setupWebSocket();
+  }
+}
+
+  if (buzzerActive && (millis() - buzzerStartTime >= buzzerDuration)) {
+    buzzer.writeMicroseconds(0);
+    buzzerActive = false;
+  }
+
+  char key = keypad.getKey();
+  if (key) {
+    Serial.print("Key pressed: ");
+    Serial.println(key);
+    handleKeypadInput(key);
+  }
+
+  switch (currentState) {
+    case DEVICE_STATE_IDLE:
+      currentState = DEVICE_STATE_MENU_NAVIGATION;
+      showMenu();
+      break;
+
+    case DEVICE_STATE_READY_TO_READ:
+      if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+        currentState = DEVICE_STATE_READING_CARD;
+      }
+      break;
+
+    case DEVICE_STATE_READING_CARD:
+      globalCardData = readCardData();
+      if (globalCardData.length() > 0) {
+        Serial.println("Card data read: " + globalCardData);
+        if (currentState == DEVICE_STATE_NEW_TRANSACTION) {
+          currentState = DEVICE_STATE_NEW_TRANSACTION;
+        } else {
+          currentState = DEVICE_STATE_SENDING_DATA;
+        }
+      } else {
+        Serial.println("Failed to read card data");
+        currentState = DEVICE_STATE_IDLE;
+      }
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+      break;
+
+    case DEVICE_STATE_SENDING_DATA:
+      sendDataToServer(globalCardData);
+      currentState = DEVICE_STATE_WAITING_RESPONSE;
+      break;
+
+    case DEVICE_STATE_WAITING_RESPONSE:
+      if (now - lastReconnectAttempt > 5000) {
+        currentState = DEVICE_STATE_IDLE;
+      }
+      break;
+
+    case DEVICE_STATE_MENU_NAVIGATION:
+      break;
+
+    case DEVICE_STATE_NEW_TRANSACTION:
+      sendNewTransactionData(globalCardData);
+      currentState = DEVICE_STATE_WAITING_RESPONSE;
+      break;
+
+    case DEVICE_STATE_NEW_QRTRANSACTION:
+      sendNewQRTransactionData(enteredAmount);
+      currentState = DEVICE_STATE_WAITING_RESPONSE;
+      break;
+
+    case DEVICE_STATE_ENTERING_AMOUNT:
+      //handleAmountEntry();
+      break;
+
+    case DEVICE_STATE_ENTERING_QR_AMOUNT:
+      //handleAmountQREntry();
+      break;
+    
+    case DEVICE_STATE_ERROR:
+      if (now - errorStartTime >= 2000) {
+        currentState = DEVICE_STATE_MENU_NAVIGATION;
+        menuState = MAIN_MENU;
+        showMenu();
+      }
+      break;
+
+    case DEVICE_STATE_DISPLAYING_QR:
+      break;
+  }
+}
+
+void printStoredValues() {
+  String deviceId = getDecryptedValue("deviceId");
+  String apiKey = getDecryptedValue("apiKey");
+  Serial.println("Stored Device ID: " + deviceId);
+  Serial.println("Stored API Key: " + apiKey);
+}
+
+void setupWebSocket() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (accessToken.length() > 0) {
+      String url = String(websocket_url) + "?token=" + accessToken;
+      Serial.println("Setting up WebSocket connection with URL: " + url);
+      webSocket.begin(websocketServer, websocket_port, url.c_str());
+      webSocket.onEvent(webSocketEvent);
+      webSocket.setReconnectInterval(5000);
+      Serial.println("WebSocket setup completed");
+    } else {
+      Serial.println("Access token is empty. Attempting to re-authenticate...");
+      authenticateDevice();
+    }
+  } else {
+    Serial.println("Cannot setup WebSocket: WiFi not connected");
+  }
+}
+
+void setDeviceId(const char* newDeviceId) {
+  storeEncryptedValue("deviceId", newDeviceId);
+  Serial.println("DeviceId set successfully");
+}
+
+void setApiKey(const char* newApiKey) {
+  storeEncryptedValue("apiKey", newApiKey);
+  Serial.println("ApiKey set successfully");
+}
+
+void generateEncryptionKey() {
+  uint64_t chipid = ESP.getEfuseMac(); // Get the 64-bit chip ID
+  uint8_t* chipid_ptr = (uint8_t*)&chipid;
+  
+  // Copy the chip ID to the chipId array
+  for (int i = 0; i < 6; i++) {
+    chipId[i] = chipid_ptr[i];
+  }
+
+  // Generate the encryption key
+  memcpy(encryptionKey, chipId, 6);
+  memcpy(encryptionKey + 6, chipId, 6);
+  memcpy(encryptionKey + 12, chipId, 4);
+}
+
+void encrypt(const String& input, String& output) {
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  mbedtls_aes_setkey_enc(&aes, encryptionKey, 128);
+  
+  size_t inputLength = input.length();
+  size_t paddedLength = (inputLength + 15) & ~15; // Round up to nearest multiple of 16
+  
+  uint8_t* paddedInput = new uint8_t[paddedLength];
+  memcpy(paddedInput, input.c_str(), inputLength);
+  uint8_t paddingByte = paddedLength - inputLength;
+  memset(paddedInput + inputLength, paddingByte, paddingByte);
+  
+  uint8_t* encryptedOutput = new uint8_t[paddedLength];
+  
+  for(size_t i = 0; i < paddedLength; i += 16) {
+    mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, paddedInput + i, encryptedOutput + i);
+  }
+  output = custom_base64::encode(encryptedOutput, paddedLength);
+  delete[] paddedInput;
+  delete[] encryptedOutput;
+  mbedtls_aes_free(&aes);
+}
+
+bool decrypt(const String& input, String& output) {
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  mbedtls_aes_setkey_dec(&aes, encryptionKey, 128);
+  
+  size_t decodedLength;
+  uint8_t* decodedInput = custom_base64::decode(input.c_str(), input.length(), &decodedLength);
+  if (!decodedInput) {
+    Serial.println("Base64 decoding failed for input: " + input);
+    return false;
+  }
+  
+  uint8_t* decryptedOutput = new uint8_t[decodedLength];
+  
+  for(size_t i = 0; i < decodedLength; i += 16) {
+    mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, decodedInput + i, decryptedOutput + i);
+  }
+  
+  // Remove PKCS7 padding
+  uint8_t paddingByte = decryptedOutput[decodedLength - 1];
+  if (paddingByte > 16 || paddingByte == 0) {
+    Serial.println("Invalid padding");
+    delete[] decodedInput;
+    delete[] decryptedOutput;
+    mbedtls_aes_free(&aes);
+    return false;
+  } 
+  output = String((char*)decryptedOutput, decodedLength - paddingByte);
+  delete[] decodedInput;
+  delete[] decryptedOutput;
+  mbedtls_aes_free(&aes);
+  return true;
+}
+
+void storeEncryptedValue(const char* key, const char* value) {
+  String encrypted;
+  encrypt(String(value), encrypted);
+  preferences.begin("secureStorage", false);
+  preferences.putString(key, encrypted);
+  preferences.end();
+}
+
+String getDecryptedValue(const char* key) {
+  preferences.begin("secureStorage", true);
+  String encrypted = preferences.getString(key, "");
+  preferences.end();
+  
+  if (encrypted.length() == 0) {
+    return "";
+  }
+  
+  String decrypted;
+  if (decrypt(encrypted, decrypted)) {
+    return decrypted;
+  } else {
+    return "";
+  }
+}
+
+void authenticateDevice() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String fullUrl = String(serverUrl) + "/api/device/authenticate";
+    http.begin(fullUrl);
+
+    unsigned long timestamp = time(nullptr);
+    String timestampStr = String(timestamp);
+
+    String deviceId = getDecryptedValue("deviceId");
+    String apiKey = getDecryptedValue("apiKey");
+    
+    String dataToSign = deviceId + timestampStr;
+    String signature = calculateHMAC(dataToSign, apiKey.c_str());
+
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("deviceId", deviceId);
+    http.addHeader("apikey", apiKey);
+    http.addHeader("timestamp", timestampStr);
+    http.addHeader("signature", signature);
+
+    int httpResponseCode = http.POST("");
+
+    if (httpResponseCode == 200) {
+      String response = http.getString();
+      StaticJsonDocument<512> doc;
+      DeserializationError error = deserializeJson(doc, response);
+      
+      if (error) {
+        Serial.print("deserializeJson() failed: ");
+        Serial.println(error.c_str());
+      } else {
+        accessToken = doc["accessToken"].as<String>();
+        refreshToken = doc["refreshToken"].as<String>();       
+        setupWebSocket();
+      }
+    } else {
+      Serial.print("Authentication failed with HTTP code: ");
+      Serial.println(httpResponseCode);
+      String response = http.getString();
+      Serial.println("Response: " + response);
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi not connected, cannot authenticate");
+  }
+}
+
+bool refreshAccessToken() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String fullUrl = String(serverUrl) + "/api/device/refresh-token";
+    http.begin(fullUrl);
+
+    http.addHeader("Content-Type", "application/json");
+
+    StaticJsonDocument<256> doc;
+    doc["refreshToken"] = refreshToken;
+    String requestBody;
+    serializeJson(doc, requestBody);
+
+    int httpResponseCode = http.POST(requestBody);
+
+    if (httpResponseCode == 200) {
+      String response = http.getString();
+      StaticJsonDocument<256> responseDoc;
+      deserializeJson(responseDoc, response);
+      accessToken = responseDoc["accessToken"].as<String>();
+      http.end();
+      return true;
+    } else {
+      http.end();
+      return false;
+    }
+  }
+  return false;
+}
+
+void handleMenuNavigation(char key) {
+  switch (key) {
+    case '5': // Up
+      if (menuState == MAIN_MENU) {
+        MainMenu = (MainMenu - 1 + TotalHomeItems) % TotalHomeItems;
+      } else if (menuState == SUB_MENU) {
+        SubMenu = (SubMenu - 1 + SubMenuCount) % SubMenuCount;
+      }
+      showMenu();
+      break;
+    case '8': // Down
+      if (menuState == MAIN_MENU) {
+        MainMenu = (MainMenu + 1) % TotalHomeItems;
+      } else if (menuState == SUB_MENU) {
+        SubMenu = (SubMenu + 1) % SubMenuCount;
+      }
+      showMenu();
+      break;
+    case '7': // Left (return to main menu)
+      if (menuState == SUB_MENU) {
+        menuState = MAIN_MENU;
+        MainMenu = 0;
+        SubMenu = 0;
+        showMenu();
+      }
+      break;
+    case '9': // Right (enter submenu or perform action)
+      if (menuState == MAIN_MENU) {
+        if (MainMenu == TotalHomeItems - 1) { // "Card Reading Mode" menu item
+          currentState = DEVICE_STATE_ENTERING_AMOUNT;
+          enteredAmount = "";
+          updateAmountDisplay();
+        } else if (MainMenu == 5) { // "QR Transact" menu item
+          currentState = DEVICE_STATE_ENTERING_QR_AMOUNT;
+          enteredAmount = "";
+          updateAmountDisplay();
+        } else {
+          menuState = SUB_MENU;
+          SubMenu = 0;
+          countSubMenuItems();
+          showMenu();
+        }
+      } else if (menuState == SUB_MENU) {
+        menuState = MENU_ACTION;
+        performMenuAction();
+      }
+      break;
+    case '*': // Cancel/Discard
+    case 'D': // Use 'D' as an alternative for cancel/return
+      if (menuState == SUB_MENU) {
+        menuState = MAIN_MENU;
+        MainMenu = 0;
+        SubMenu = 0;
+        showMenu();
+      } else if (menuState == MAIN_MENU) {
+        // Do nothing, stay in the main menu
+        showMenu();
+      }
+      break;
+    case '#': // Confirm/Enter
+      if (menuState == MAIN_MENU) {
+        if (MainMenu == 5) { // "QR Transact" menu item
+          currentState = DEVICE_STATE_ENTERING_QR_AMOUNT;
+          enteredAmount = "";
+          updateAmountDisplay();
+        } else {
+          menuState = SUB_MENU;
+          SubMenu = 0;
+          countSubMenuItems();
+          showMenu();
+        }
+      } else if (menuState == SUB_MENU) {
+        menuState = MENU_ACTION;
+        performMenuAction();
+      }
+      break;
+  }
+}
+
+void playBuzzer() {
+  buzzer.writeMicroseconds(1000); // Play a tone
+  buzzerStartTime = millis();     // Record the start time
+  buzzerActive = true;            // Set the buzzer as active
+}
+
+void showMenu() {
+  tft.fillScreen(TFT_BLACK);  // Clear the screen
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+
+  // Debug info
+  Serial.println("Showing menu");
+  Serial.println("Menu state: " + String(menuState));
+  Serial.println("Main Menu index: " + String(MainMenu));
+
+  if (menuState == MAIN_MENU) {
+    int startIndex = (MainMenu / MENU_ITEMS_PER_PAGE) * MENU_ITEMS_PER_PAGE;
+    int endIndex = min(startIndex + MENU_ITEMS_PER_PAGE, TotalHomeItems);
+    
+    // Draw title
+    tft.setTextSize(2);
+    tft.drawString("Main Menu", 10, 5);
+    tft.setTextSize(1);
+
+    for (int i = startIndex; i < endIndex; i++) {
+      int y = 25 + (i - startIndex) * 20; // Increased spacing between items
+
+      // Debug info
+      Serial.println("Drawing menu item " + String(i) + " at y=" + String(y) + ": " + String(HomeMenu[i]));
+
+      // Draw selection indicator
+      if (i == MainMenu) {
+        tft.fillRect(0, y-2, 5, 15, TFT_WHITE); // Selection marker
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK); // Highlight selected item
+      } else {
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      }
+
+      // Draw menu item text
+      tft.drawString(HomeMenu[i], 10, y);
+    }
+
+  } else if (menuState == SUB_MENU) {
+    // Draw title
+    tft.setTextSize(2);
+    tft.drawString(HomeMenu[MainMenu], 10, 5);
+    tft.setTextSize(1);
+
+    for (int i = 0; i < SubMenuCount; i++) {
+      int y = 25 + i * 20;
+
+      // Debug info
+      Serial.println("Drawing submenu item " + String(i) + " at y=" + String(y) + ": " + String(SubItems[MainMenu][i]));
+
+      if (i == SubMenu) {
+        tft.fillRect(0, y-2, 5, 15, TFT_WHITE);
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+      } else {
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      }
+
+      tft.drawString(SubItems[MainMenu][i], 10, y);
+    }
+  }
+}
+
+void handleKeypadInput(char key) {
+  switch (currentState) {
+    case DEVICE_STATE_MENU_NAVIGATION:
+      handleMenuNavigation(key);
+      break;
+    case DEVICE_STATE_ENTERING_AMOUNT:
+    case DEVICE_STATE_ENTERING_QR_AMOUNT:
+      handleAmountEntry(key);
+      break;
+    case DEVICE_STATE_READY_TO_READ:
+      if (key == 'D') {
+        currentState = DEVICE_STATE_MENU_NAVIGATION;
+        showMenu();
+      }
+      break;
+    case DEVICE_STATE_ERROR:
+      currentState = DEVICE_STATE_ENTERING_QR_AMOUNT;
+      enteredAmount = "";
+      updateAmountDisplay();
+      break;
+    case DEVICE_STATE_DISPLAYING_QR:
+      Serial.println("In DEVICE_STATE_DISPLAYING_QR");
+      if (key == 'D') {
+        Serial.println("'D' key pressed, returning to menu");
+        tft.fillScreen(TFT_BLACK);
+        currentState = DEVICE_STATE_MENU_NAVIGATION;
+        menuState = MAIN_MENU;
+        showMenu();
+      }
+      break;
+
+    case DEVICE_STATE_WAITING_RESPONSE:
+      if (key == 'D') {
+        Serial.println("'D' key pressed in WAITING_RESPONSE state, returning to menu");
+        tft.fillScreen(TFT_BLACK);
+        currentState = DEVICE_STATE_MENU_NAVIGATION;
+        menuState = MAIN_MENU;
+        showMenu();
+      }
+      break;
+  }
+}
+
+void handleAmountEntry(char key) {
+  if (key >= '0' && key <= '9') {
+    enteredAmount += key;
+    updateAmountDisplay();
+  } else if (key == '#') {
+    if (currentState == DEVICE_STATE_ENTERING_AMOUNT) {
+      if (MainMenu == TotalHomeItems - 1) {
+        currentState = DEVICE_STATE_READY_TO_READ;
+        prepareForNewCard();
+      } else {
+        currentState = DEVICE_STATE_NEW_TRANSACTION;
+      }
+    } else if (currentState == DEVICE_STATE_ENTERING_QR_AMOUNT) {
+      currentState = DEVICE_STATE_NEW_QRTRANSACTION;
+    }
+  } else if (key == '*') {
+    if (enteredAmount.indexOf('.') == -1) {
+      enteredAmount += '.';
+      updateAmountDisplay();
+    }
+  } else if (key == 'D') {
+    currentState = DEVICE_STATE_MENU_NAVIGATION;
+    showMenu();
+  }
+}
+
+void updateAmountDisplay() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextFont(1);
+tft.setTextSize(2);
+  tft.drawString("Enter amount:", 0, 0);
+  tft.drawString(enteredAmount.c_str(), 0, 20);
+  if (MainMenu == TotalHomeItems - 1) {
+    tft.drawString("For Card Reading", 0, 40);
+  }
+  Serial.println("Current amount: " + enteredAmount);
+}
+
+void prepareForNewCard() {
+  Serial.println("Preparing to read a new card...");
+  mfrc522.PCD_Reset();
+  mfrc522.PCD_Init();
+  currentState = DEVICE_STATE_READY_TO_READ;
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextFont(1);
+tft.setTextSize(2);
+  tft.drawString("Ready to read", 0, 0);
+  tft.drawString("new card", 0, 10);
+  tft.drawString("Amount:", 0, 30);
+  tft.drawString(enteredAmount.c_str(), 0, 40);
+}
+
+void countSubMenuItems() {
+  SubMenuCount = 0;
+  for (int i = 0; i < MaxSubMenuItems; i++) {
+    char buffer[20];
+    strncpy(buffer, SubItems[MainMenu][i], sizeof(buffer));
+    buffer[sizeof(buffer) - 1] = '\0';
+    if (buffer[0] != '\0') {
+      SubMenuCount++;
+    }
+  }
+}
+
+String readCardData() {
+  String cardData = "";
+  byte buffer[18];
+  byte size = sizeof(buffer);
+
+  for (byte block = 12; block <= 63; block++) {
+    if ((block + 1) % 4 == 0) continue; // Skip sector trailers
+
+    if (mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(mfrc522.uid)) != MFRC522::STATUS_OK) {
+      Serial.print(F("Authentication failed at block "));
+      Serial.println(block);
+      return "";
+    }
+
+    if (mfrc522.MIFARE_Read(block, buffer, &size) != MFRC522::STATUS_OK) {
+      Serial.print(F("MIFARE_Read() failed at block "));
+      Serial.println(block);
+      return "";
+    }
+
+    for (byte i = 0; i < 16; i++) {
+      if (buffer[i] != 0) {
+        cardData += (char)buffer[i];
+      } else {
+        // We've reached the end of the data
+        return cardData;
+      }
+    }
+  }
+
+  return cardData;
+}
+
+void sendDataToServer(String cardData) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String fullUrl = String(serverUrl)  + "/api/chargeVerfiy/merchant-initiate-verify";
+    http.begin(fullUrl);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " + accessToken);
+    unsigned long timestamp = time(nullptr);
+    String timestampStr = String(timestamp);
+    StaticJsonDocument<512> jsonDoc;
+    DeserializationError error = deserializeJson(jsonDoc, cardData);
+    if (error) {
+      Serial.print(F("deserializeJson() failed: "));
+      Serial.println(error.c_str());
+      return;
+    }
+
+    JsonObject nfcData = jsonDoc["nfcData"];
+    String phoneNumber = nfcData["phoneNumber"].as<String>();
+    String email = nfcData["email"].as<String>();
+    String customerId = nfcData["customerId"].as<String>();
+    String provider = nfcData["provider"].as<String>();
+
+    float amount = enteredAmount.toFloat();
+    int amountInSmallestUnit = static_cast<int>(amount * 100);
+
+    StaticJsonDocument<512> requestDoc;
+    JsonObject requestNfcData = requestDoc.createNestedObject("nfcData");
+    requestNfcData["phoneNumber"] = phoneNumber;
+    requestNfcData["email"] = email;
+    requestNfcData["customerId"] = customerId;
+    requestNfcData["provider"] = provider;
+    requestDoc["amount"] = amountInSmallestUnit;
+
+    String requestBody;
+    serializeJson(requestDoc, requestBody);
+
+    String dataToSign = String(deviceId) + timestampStr;
+    String signature = calculateHMAC(dataToSign, apiKey);
+
+    http.addHeader("deviceId", deviceId);
+    http.addHeader("timestamp", timestampStr);
+    http.addHeader("signature", signature);
+
+    int httpResponseCode = http.POST(requestBody);
+
+    if (httpResponseCode == 401) {
+      refreshAccessToken();
+      http.addHeader("Authorization", "Bearer " + accessToken);
+      httpResponseCode = http.POST(requestBody);
+    }
+
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("HTTP Response code: " + String(httpResponseCode));
+      Serial.println("Response: " + response);
+    } else {
+      Serial.print("Error on sending POST: ");
+      Serial.println(httpResponseCode);
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi not connected");
+  }
+}
+
+void displayQRCode(String authorizationUrl) {
+  Serial.println("Displaying QR Code");
+  tft.fillScreen(TFT_BLACK);  tft.setTextFont(1);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Press 'D' to return", tft.width() / 2, tft.height() - 20, 1);
+  
+  currentState = DEVICE_STATE_WAITING_RESPONSE;
+}
+
+void sendNewTransactionData(String cardData) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+
+    String fullUrl = String(serverUrl) + "/api/chargeVerfiy/initialize-transaction";
+    http.begin(fullUrl);
+
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " + accessToken);
+
+    // Create a new JSON document for the request
+    StaticJsonDocument<256> requestDoc;
+    requestDoc["amount"] = enteredAmount.toInt() * 100;  // Convert to smallest currency unit
+
+    String requestBody;
+    serializeJson(requestDoc, requestBody);
+
+    int httpResponseCode = http.POST(requestBody);
+
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("HTTP Response code: " + String(httpResponseCode));
+      Serial.println("Response: " + response);
+
+      // Parse the response
+      StaticJsonDocument<512> responseDoc;
+      DeserializationError responseError = deserializeJson(responseDoc, response);
+
+      if (!responseError) {
+        String authorizationUrl = responseDoc["data"]["authorization_url"];
+        String accessCode = responseDoc["data"]["access_code"];
+        displayQRCode(authorizationUrl);
+      }
+    } else {
+      Serial.print("Error on sending POST: ");
+      Serial.println(httpResponseCode);
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi not connected");
+  }
+}
+
+void sendNewQRTransactionData(String amount) {
+  Serial.println("Sending QR transaction data. Amount: " + amount);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+
+    String fullUrl = String(serverUrl) + "/api/chargeVerfiy/initialize-transaction";
+    Serial.println("URL: " + fullUrl);
+
+    unsigned long timestamp = time(nullptr);
+    String timestampStr = String(timestamp);
+
+    http.begin(fullUrl);
+
+    String dataToSign = String(deviceId) + timestampStr;
+    String signature = calculateHMAC(dataToSign, apiKey);
+
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " + accessToken);
+    http.addHeader("deviceId", deviceId);
+    http.addHeader("timestamp", timestampStr);
+    http.addHeader("signature", signature);
+    
+    StaticJsonDocument<256> requestDoc;
+    requestDoc["amount"] = amount.toInt() * 100;
+
+    String requestBody;
+    serializeJson(requestDoc, requestBody);
+    Serial.println("Request body: " + requestBody);
+
+    int httpResponseCode = http.POST(requestBody);
+
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("HTTP Response code: " + String(httpResponseCode));
+      Serial.println("Response: " + response);
+
+      StaticJsonDocument<512> responseDoc;
+      DeserializationError responseError = deserializeJson(responseDoc, response);
+
+      if (!responseError) {
+        if (responseDoc["data"].containsKey("authorization_url") && !responseDoc["data"]["authorization_url"].isNull()) {
+          String authorizationUrl = responseDoc["data"]["authorization_url"];
+          String accessCode = responseDoc["data"]["access_code"];
+          displayQRCode(authorizationUrl);
+        } else {
+          showErrorMessage("Error: No QR data");
+          return;
+        }
+      } else {
+        showErrorMessage("Error: Invalid response");
+        return;
+      }
+    } else {
+      Serial.print("Error on sending POST: ");
+      Serial.println(httpResponseCode);
+      showErrorMessage("Error: Network issue");
+      return;
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi not connected");
+    showErrorMessage("Error: No WiFi");
+    return;
+  }
+}
+
+String calculateHMAC(String data, const char* key) {
+  byte hmacResult[32];
+  mbedtls_md_context_t ctx;
+  mbedtls_md_type_t md_type = MBEDTLS_MD_SHA256;
+
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(md_type), 1);
+  mbedtls_md_hmac_starts(&ctx, (const unsigned char*)key, strlen(key));
+  mbedtls_md_hmac_update(&ctx, (const unsigned char*)data.c_str(), data.length());
+  mbedtls_md_hmac_finish(&ctx, hmacResult);
+  mbedtls_md_free(&ctx);
+
+  String signature = "";
+  for(int i = 0; i < sizeof(hmacResult); i++){
+      char str[3];
+      sprintf(str, "%02x", (int)hmacResult[i]);
+      signature += str;
+  }
+  return signature;
+}
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  StaticJsonDocument<512> doc;
+  DeserializationError error;
+
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println("WebSocket disconnected");
+      break;
+    case WStype_CONNECTED:
+      Serial.println("WebSocket connected");
+      break;
+    case WStype_TEXT:
+      Serial.printf("WebSocket received text: %s\n", payload);
+      
+      error = deserializeJson(doc, payload);
+      if (error) {
+        Serial.print("deserializeJson() failed: ");
+        Serial.println(error.c_str());
+        return;
+      }
+      
+      if (doc.containsKey("type") && doc["type"] == "transaction_update" &&
+          doc["data"].containsKey("status") && doc["data"]["status"] == "success") {
+        Serial.println("Transaction successful!");
+        
+        pinMode(LED_BUILTIN, OUTPUT);
+        for (int i = 0; i < 3; i++) {
+          digitalWrite(LED_BUILTIN, HIGH);
+          delay(250);
+          digitalWrite(LED_BUILTIN, LOW);
+          delay(250);
+        }
+      } else {
+        Serial.println("Transaction failed or status unknown.");
+      }
+      break;
+    case WStype_BIN:
+      Serial.println("WebSocket received binary data");
+      break;
+    case WStype_ERROR:
+      Serial.println("WebSocket error");
+      break;
+    case WStype_PING:
+      Serial.println("WebSocket ping");
+      break;
+    case WStype_PONG:
+      Serial.println("WebSocket pong");
+      break;
+  }
+}
+
+enum TransactionType {
+  SUCCESS,
+  PENDINGS,
+  FAILED
+};
+
+void fetchTransactions(TransactionType type);
+
+void fetchTransactions(TransactionType type) {
+  if (WiFi.status() != WL_CONNECTED) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextFont(1);
+tft.setTextSize(2);
+    tft.drawString("WiFi not connected", 0, 0);
+    delay(2000);
+    return;
+  }
+
+  HTTPClient http;
+  const char* statusParam;
+  switch (type) {
+    case SUCCESS: statusParam = "success"; break;
+    case PENDINGS: statusParam = "pending"; break;
+    case FAILED:  statusParam = "failed"; break;
+  }
+
+  char url[250];
+  snprintf(url, sizeof(url), "%s/api/transactions/transactions?status=%s&deviceId=%s", serverUrl, statusParam, deviceId);
+
+  Serial.print("Requesting URL: ");
+  Serial.println(url);
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + accessToken);
+
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextFont(1);
+  tft.setTextSize(2);
+  tft.drawString("Fetching transactions...", 0, 0);
+
+  int httpResponseCode = http.GET();
+
+  if (httpResponseCode > 0) {
+    String payload = http.getString();
+    Serial.println("Received payload:");
+    Serial.println(payload);
+
+    DynamicJsonDocument doc(4096);
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (error) {
+      tft.fillScreen(TFT_BLACK);
+      tft.drawString("JSON parsing failed", 0, 0);
+    } else {
+      JsonArray transactions = doc["data"];
+
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextFont(1);
+      tft.setTextSize(2);
+
+      int y = 0;
+      for (JsonObject transaction : transactions) {
+        char displayText[64];
+        const char* phone = transaction["phone"].as<const char*>();
+        int amount = transaction["amount"].as<int>();
+
+        snprintf(displayText, sizeof(displayText), "%s: %d", phone, amount);
+
+        tft.drawString(displayText, 0, y);
+        y += 10;
+
+        if (y >= 64) break;
+      }
+    }
+  } else {
+    tft.fillScreen(TFT_BLACK);
+    tft.drawString("HTTP request failed", 0, 0);
+    tft.drawString(String(httpResponseCode).c_str(), 0, 10);
+  }
+  http.end();
+
+  delay(5000);
+  showMenu();
+}
+
+void performMenuAction() {
+  switch (MainMenu) {
+    case 0: // History
+      if (menuState == SUB_MENU) {
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextFont(1);
+        tft.setTextSize(2);
+        tft.drawString("History", 0, 0);
+        tft.drawString("1. Success", 0, 15);
+        tft.drawString("2. Declined", 0, 30);
+        tft.drawString("3. Pending", 0, 45);
+      } else if (menuState == MENU_ACTION) {
+        switch (SubMenu) {
+          case 0: fetchTransactions(SUCCESS); break;
+          case 1: fetchTransactions(FAILED); break;
+          case 2: fetchTransactions(PENDINGS); break;
+        }
+      }
+      break;
+
+    case 1: // Refunds
+      currentState = DEVICE_STATE_ENTERING_AMOUNT;
+      enteredAmount = "";
+      updateAmountDisplay();
+      tft.drawString("Enter refund amount", 0, 40);
+      break;
+
+    case 2: // Cash Out
+      currentState = DEVICE_STATE_ENTERING_AMOUNT;
+      enteredAmount = "";
+      updateAmountDisplay();
+      tft.drawString("Enter cash out amount", 0, 40);
+      break;
+
+    case 3: // Settings
+      switch (SubMenu) {
+        case 1: // Battery
+          tft.fillScreen(TFT_BLACK);
+          tft.drawString("Battery Status", 0, 0);
+          tft.drawString("Level: XX%", 0, 20);
+          break;
+        case 2: // Reset
+          ESP.restart();
+          break;
+        case 3: // Network Test
+          if (WiFi.status() == WL_CONNECTED) {
+            tft.fillScreen(TFT_BLACK);
+            tft.drawString("Network Test", 0, 0);
+            tft.drawString("Connected to WiFi", 0, 20);
+            tft.drawString(WiFi.SSID().c_str(), 0, 30);
+          } else {
+            tft.fillScreen(TFT_BLACK);
+            tft.drawString("Network Test", 0, 0);
+            tft.drawString("Not connected", 0, 20);
+          }
+          break;
+      }
+      break;
+
+    case 4: // Register
+      currentState = DEVICE_STATE_READY_TO_READ;
+      tft.fillScreen(TFT_BLACK);
+      tft.drawString("Card Registration", 0, 0);
+      tft.drawString("Place card on reader", 0, 20);
+      break;
+
+    case 5: // QR Transact
+      currentState = DEVICE_STATE_ENTERING_QR_AMOUNT;
+      enteredAmount = "";
+      updateAmountDisplay();
+      tft.drawString("Enter QR amount", 0, 40);
+      break;
+
+    case 6: // Card Reading Mode
+      currentState = DEVICE_STATE_READY_TO_READ;
+      prepareForNewCard();
+      break;
+
+    default:
+      menuState = MAIN_MENU;
+      showMenu();
+      break;
+  }
+
+  if (currentState != DEVICE_STATE_ENTERING_AMOUNT && 
+      currentState != DEVICE_STATE_ENTERING_QR_AMOUNT && 
+      currentState != DEVICE_STATE_READY_TO_READ) {
+    menuState = MAIN_MENU;
+    showMenu();
+  }
+}
